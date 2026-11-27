@@ -77,14 +77,22 @@ def create_parser(mode='train'):
     parser.add_argument("--root3", default='/home/data/SEN12MSCR', type=str, help="path to your copy of SEN12MS-CR for pretraining")
     parser.add_argument("--precomputed", default='/home/code/UnCRtainTS/util/precomputed', type=str, help="path to pre-computed cloud statistics")
     parser.add_argument("--region", default="all", type=str, help="region to (sub-)sample ROI from [all|africa|america|asiaEast|asiaWest|europa]")
+    parser.add_argument("--eval_region", default="all", type=str, help="region for the validation and test splits during training [all|africa|america|asiaEast|asiaWest|europa]")
     parser.add_argument("--max_samples_count", default=int(1e9), type=int, help="count of data (sub-)samples to take")
     parser.add_argument("--max_samples_frac", default=1.0, type=float, help="fraction of data (sub-)samples to take")
     parser.add_argument("--profile", dest="profile", action="store_true", help="whether to profile code or not") 
     parser.add_argument("--trained_checkp", default="", type=str, help="Path to loading a pre-trained network *.pth file, rather than initializing weights randomly")
 
     # flags specific to uncertainty modeling
-    parser.add_argument("--covmode", default='diag', type=str, help="covariance matrix type [uni|iso|diag].")
+    parser.add_argument("--covmode", default='diag', type=str, help="covariance matrix type [uni|iso|diag|full]. 'full' predicts a Cholesky factor (91 values per pixel for 13 bands).")
     parser.add_argument("--scale_by", default=1.0, type=float, help="rescale data within model, e.g. to [0,10]")
+    # flags specific to the full-covariance model (--covmode full)
+    parser.add_argument("--cov_init_sigma", default=0.05, type=float, help="initial standard deviation of the diagonal of the Cholesky factor (original scale)")
+    parser.add_argument("--cov_init_scale", default=0.01, type=float, help="multiplier on the random initial weights of the covariance head (small = near-zero start)")
+    parser.add_argument("--cov_lr_mult", default=1.0, type=float, help="learning-rate multiplier for the covariance head, e.g. 0.1")
+    parser.add_argument("--grad_clip", default=0.0, type=float, help="max gradient norm; 0 disables clipping")
+    parser.add_argument("--beta_nll", default=0.0, type=float, help="beta-NLL exponent (0 = plain NLL)")
+    parser.add_argument("--mean_only_epochs", default=0, type=int, help="train the mean with MSE only for this many epochs before switching to NLL")
     parser.add_argument("--separate_out", dest="separate_out", action="store_true", help="whether to separately process mean and variance predictions or in a shared layer")
 
     # flags specific for testing

@@ -22,7 +22,7 @@ sys.path.append(os.path.dirname(dirname))
 
 from parse_args import create_parser
 from data.dataLoader import SEN12MSCR, SEN12MSCRTS
-from src.model_utils import get_model, save_model, freeze_layers, load_model, load_checkpoint
+from src.model_utils import get_model, save_model, freeze_layers, load_model, load_checkpoint, init_full_cov_head
 from src.learning.metrics import img_metrics, avg_img_metrics
 
 import torch
@@ -58,6 +58,11 @@ if config.loss in ['GNLL', 'MGNLL']:
         config.out_conv[-1] += 1
     elif config.covmode in ['uni', 'diag']:
         config.out_conv[-1] += S2_BANDS
+        config.var_nonLinearity = 'softplus'
+    elif config.covmode == 'full':
+        # Cholesky factor of a full 13x13 covariance: lower triangle has 13*14/2 = 91 entries per pixel
+        assert config.loss == 'MGNLL', "--covmode full requires --loss MGNLL"
+        config.out_conv[-1] += S2_BANDS * (S2_BANDS + 1) // 2
         config.var_nonLinearity = 'softplus'
 
 # grab the PID so we can look it up in the logged config for server-side process management
@@ -556,11 +561,12 @@ def save_results(metrics, path, split='test'):
 
 
 # check for file of pre-computed statistics, e.g. indices or cloud coverage
-def import_from_path(split, config):
+def import_from_path(split, config, region=None):
+    region = region if region is not None else config.region
     if os.path.exists(os.path.join(os.path.dirname(os.getcwd()), 'util', 'precomputed')):
-        import_path = os.path.join(os.path.dirname(os.getcwd()), 'util', 'precomputed', f'generic_{config.input_t}_{split}_{config.region}_s2cloudless_mask.npy')
+        import_path = os.path.join(os.path.dirname(os.getcwd()), 'util', 'precomputed', f'generic_{config.input_t}_{split}_{region}_s2cloudless_mask.npy')
     else:
-        import_path = os.path.join(config.precomputed, f'generic_{config.input_t}_{split}_{config.region}_s2cloudless_mask.npy')
+        import_path = os.path.join(config.precomputed, f'generic_{config.input_t}_{split}_{region}_s2cloudless_mask.npy')
     import_data_path = import_path if os.path.isfile(import_path) else None
     return import_data_path
     
@@ -577,8 +583,8 @@ def main(config):
         dt_test     = SEN12MSCR(os.path.expanduser(config.root3), split='test', region=config.region, sample_type=config.sample_type)
     else:
         dt_train    = SEN12MSCRTS(os.path.expanduser(config.root1), split='train', region=config.region, sample_type=config.sample_type, sampler = 'random' if config.vary_samples else 'fixed', n_input_samples=config.input_t, import_data_path=import_from_path('train', config), min_cov=config.min_cov, max_cov=config.max_cov)
-        dt_val      = SEN12MSCRTS(os.path.expanduser(config.root2), split='val', region='all', sample_type=config.sample_type , n_input_samples=config.input_t, import_data_path=import_from_path('val', config)) 
-        dt_test     = SEN12MSCRTS(os.path.expanduser(config.root2), split='test', region='all', sample_type=config.sample_type , n_input_samples=config.input_t, import_data_path=import_from_path('test', config))
+        dt_val      = SEN12MSCRTS(os.path.expanduser(config.root2), split='val', region=config.eval_region, sample_type=config.sample_type , n_input_samples=config.input_t, import_data_path=import_from_path('val', config, config.eval_region)) 
+        dt_test     = SEN12MSCRTS(os.path.expanduser(config.root2), split='test', region=config.eval_region, sample_type=config.sample_type , n_input_samples=config.input_t, import_data_path=import_from_path('test', config, config.eval_region))
 
     # wrap to allow for subsampling, e.g. for test runs etc
     dt_train    = torch.utils.data.Subset(dt_train, range(0, min(config.max_samples_count, len(dt_train), int(len(dt_train)*config.max_samples_frac))))
@@ -631,6 +637,10 @@ def main(config):
         print(f'Loading weights from (pre-)trained checkpoint {config.trained_checkp}')
         load_model(config, model, train_out_layer=True, load_out_partly=config.model in ['uncrtaints'])
 
+    # full covariance: start the covariance head near zero correlation (not when resuming a full-covariance run)
+    if config.covmode == 'full' and not config.resume_from:
+        init_full_cov_head(model, config)
+
     with open(os.path.join(config.res_dir, config.experiment_name, "conf.json"), "w") as file:
         file.write(json.dumps(vars(config), indent=4))
     print(f"TOTAL TRAINABLE PARAMETERS: {config.N_params}\n")
@@ -653,6 +663,10 @@ def main(config):
         # put all networks in training mode again
         model.train()
         model.netG.train()
+
+        # mean-only (MSE) warm-up phase before switching to the full-covariance NLL
+        model.mean_only = (config.covmode == 'full' and epoch <= config.mean_only_epochs)
+        if model.mean_only: print('Mean-only warm-up epoch: training the mean with MSE, covariance head idle')
 
         # unfreeze all layers after specified epoch
         if epoch>config.unfreeze_after and hasattr(model, 'frozen') and model.frozen:

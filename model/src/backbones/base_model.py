@@ -43,7 +43,13 @@ class BaseModel(nn.Module):
         self.log_vars  = None
 
         # 2 optimizer: for G
-        paramsG = [{'params': self.netG.parameters()}]
+        if config.covmode == 'full' and getattr(config, 'cov_lr_mult', 1.0) != 1.0:
+            # separate (e.g. smaller) learning rate for the covariance head
+            cov_params  = [p for n, p in self.netG.named_parameters() if n.startswith('out_conv_cov')]
+            rest_params = [p for n, p in self.netG.named_parameters() if not n.startswith('out_conv_cov')]
+            paramsG = [{'params': rest_params}, {'params': cov_params, 'lr': config.lr * config.cov_lr_mult}]
+        else:
+            paramsG = [{'params': self.netG.parameters()}]
 
         self.optimizer_G = torch.optim.Adam(paramsG, lr=config.lr)
 
@@ -56,6 +62,8 @@ class BaseModel(nn.Module):
         self.dates  = None
         self.masks  = None
         self.netG.variance = None
+        self.mean_only = False   # set per epoch by the train script: mean-only (MSE) warm-up phase for --covmode full
+        self.grad_norm = None    # gradient norm of the last optimisation step (before clipping)
 
     def forward(self):
         # forward through generator, note: for val/test splits, 
@@ -78,6 +86,14 @@ class BaseModel(nn.Module):
 
 
     def get_loss_G(self):
+
+        if self.config.covmode == 'full' and self.netG.training and self.mean_only:
+            # warm-up: train the means with plain MSE only; covariance is still computed (without gradient) for logging
+            mean = self.fake_B[:, :, :S2_BANDS, ...]
+            with torch.no_grad():
+                _, self.netG.variance = self.criterion(mean, self.real_B, self.fake_B[:, :, S2_BANDS:, ...])
+            self.loss_G = torch.nn.functional.mse_loss(mean, self.real_B)
+            return
 
         if hasattr(self.netG, 'vars_idx'):
             self.loss_G, self.netG.variance = losses.calc_loss(self.criterion, self.config, self.fake_B[:, :, :self.netG.mean_idx, ...], self.real_B, var=self.fake_B[:, :, self.netG.mean_idx:self.netG.vars_idx, ...])
@@ -119,6 +135,9 @@ class BaseModel(nn.Module):
         # update G
         self.optimizer_G.zero_grad() 
         self.backward_G()
+        # gradient norm (always recorded, to spot blow-ups); clip only if --grad_clip > 0
+        clip = getattr(self.config, 'grad_clip', 0.0)
+        self.grad_norm = torch.nn.utils.clip_grad_norm_(self.netG.parameters(), clip if clip > 0 else float('inf'))
         self.optimizer_G.step()
 
         # re-scale inputs, predicted means, predicted variances, etc

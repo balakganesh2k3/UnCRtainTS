@@ -8,6 +8,8 @@ from torch.overrides import has_torch_function_variadic, handle_torch_function
 
 from torch import vmap
 
+from src.full_nll import full_nll, raw_to_cholesky, cholesky_to_covar
+
 S2_BANDS = 13
 
 
@@ -16,7 +18,11 @@ def get_loss(config):
         criterion1 = GaussianNLLLoss(reduction='mean', eps=1e-8, full=True)
         criterion = lambda pred, targ, var: criterion1(pred, targ, var)
     elif config.loss == "MGNLL":
-        criterion1 = MultiGaussianNLLLoss(reduction='mean', eps=1e-8, full=True, mode=config.covmode, chunk=config.chunk_size)
+        if config.covmode == 'full':
+            # full 13x13 covariance via Cholesky factor, see src/full_nll.py
+            criterion1 = FullGaussianNLLLoss(eps=1e-4 * config.scale_by, beta=getattr(config, 'beta_nll', 0.0))
+        else:
+            criterion1 = MultiGaussianNLLLoss(reduction='mean', eps=1e-8, full=True, mode=config.covmode, chunk=config.chunk_size)
         criterion = lambda pred, targ, var: criterion1(pred, targ, var)
     elif config.loss=="l1":
         criterion1 = nn.L1Loss()
@@ -352,3 +358,26 @@ class MultiGaussianNLLLoss(_Loss):
     
     def forward(self, input: Tensor, target: Tensor, var: Tensor) -> Tensor:
         return multi_gaussian_nll_loss(input, target, var, full=self.full, eps=self.eps, reduction=self.reduction, mode=self.mode, chunk=self.chunk)
+
+
+
+class FullGaussianNLLLoss(nn.Module):
+    """Multivariate Gaussian NLL with a full 13x13 covariance, parameterised by its Cholesky factor.
+
+    forward(input, target, var):
+        input, target: [B, 1, C, H, W]   (predicted mean and target)
+        var:           [B, 1, K, H, W]   raw network outputs, K = C*(C+1)/2 = 91
+    returns (loss, covariance) with covariance of shape [B, 1, C, C, H, W], like the diagonal losses.
+    No clamping and no nan_to_num: if training diverges, the loss shows it.
+    """
+    def __init__(self, eps=1e-4, beta=0.0):
+        super().__init__()
+        self.eps  = eps
+        self.beta = beta
+
+    def forward(self, input, target, var):
+        mean, targ, raw = input.squeeze(dim=1), target.squeeze(dim=1), var.squeeze(dim=1)
+        loss = full_nll(mean, raw, targ, C=S2_BANDS, eps=self.eps, const=True, reduction='mean', beta=self.beta)
+        with torch.no_grad():   # covariance for logging/export only
+            covar = cholesky_to_covar(raw_to_cholesky(raw.float(), S2_BANDS, self.eps))
+        return loss, covar

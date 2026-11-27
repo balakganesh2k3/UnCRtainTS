@@ -362,6 +362,8 @@ class UNCRTAINTS(nn.Module):
             covar_dim = 1
         elif covmode=='diag':
             covar_dim = S2_BANDS
+        elif covmode=='full':
+            covar_dim = S2_BANDS * (S2_BANDS + 1) // 2    # 91 entries of the lower-triangular Cholesky factor
         else: covar_dim = 0 
 
         self.mean_idx = S2_BANDS
@@ -373,7 +375,12 @@ class UNCRTAINTS(nn.Module):
 
         eps = 1e-9 if self.scale_by==1.0 else 1e-3
 
-        if self.separate_out: # define two separate layer streams for mean and variance predictions
+        if self.covmode == 'full':
+            # two separate 1x1 heads on the shared decoder features: 13 means (key 'out_conv', so that the
+            # pretrained mean head can be loaded) and 91 raw Cholesky entries (key 'out_conv_cov')
+            self.out_conv     = ConvBlock(nkernels=[decoder_widths[0]] + [S2_BANDS], k=1, s=1, p=0, norm='none', last_relu=False)
+            self.out_conv_cov = ConvBlock(nkernels=[decoder_widths[0]] + [covar_dim], k=1, s=1, p=0, norm='none', last_relu=False)
+        elif self.separate_out: # define two separate layer streams for mean and variance predictions
             self.out_conv_mean_1 = ConvBlock(nkernels=[decoder_widths[0]] + [S2_BANDS], k=1, s=1, p=0, norm='none', last_relu=False)
             if self.out_dims - self.mean_idx > 0:
                 self.out_conv_var_1 = ConvBlock(nkernels=[decoder_widths[0]] + [self.out_dims - S2_BANDS], k=1, s=1, p=0, norm='none', last_relu=False)
@@ -421,7 +428,9 @@ class UNCRTAINTS(nn.Module):
         for layer in self.out_block:
             out = layer.smart_forward(out)
 
-        if self.separate_out:
+        if self.covmode == 'full':
+            out = torch.cat((self.out_conv(out), self.out_conv_cov(out)), dim=1)   # [B x (13+91) x H x W]
+        elif self.separate_out:
             out_mean_1 = self.out_conv_mean_1(out)
 
             if self.out_dims - self.mean_idx > 0:
@@ -441,7 +450,10 @@ class UNCRTAINTS(nn.Module):
         out_loc   = self.out_mean(out[:,:,:self.mean_idx,...])                      # mean predictions in [0,1]
         if not self.covmode: return out_loc
 
-        out_cov = self.diag_var(out[:,:,self.mean_idx:self.vars_idx,...])           # var predictions > 0
+        if self.covmode == 'full':
+            out_cov = out[:,:,self.mean_idx:self.vars_idx,...]                      # raw Cholesky entries, made positive-definite inside the loss (src/full_nll.py)
+        else:
+            out_cov = self.diag_var(out[:,:,self.mean_idx:self.vars_idx,...])       # var predictions > 0
         out     = torch.cat((out_loc, out_cov), dim=2)                              # stack mean and var predictions plus cloud masks
         
         return out

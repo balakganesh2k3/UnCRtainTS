@@ -229,3 +229,23 @@ def freeze_layers(net, apply_to=None, grad=False):
                         v.requires_grad_(grad)
                 else: # otherwise apply indiscriminately to all layers
                     v.requires_grad_(grad)
+
+def init_full_cov_head(model, config):
+    """Initialise the 91-channel Cholesky head of --covmode full near a sensible, uncorrelated start:
+    tiny weights, zero bias on off-diagonal entries, and a bias on the diagonal entries so that the
+    initial standard deviation is cov_init_sigma (in original reflectance units). Call AFTER random init
+    and AFTER loading pretrained mean weights; do NOT call when resuming from a full-covariance checkpoint."""
+    import math
+    from src.full_nll import diag_positions
+    sigma0 = config.cov_init_sigma * config.scale_by
+    raw0   = math.log(math.expm1(max(sigma0 - 1e-4 * config.scale_by, 1e-6)))   # softplus(raw0) + eps = sigma0
+    n_w = n_b = 0
+    with torch.no_grad():
+        for name, p in model.netG.named_parameters():
+            if not name.startswith('out_conv_cov'): continue
+            if name.endswith('weight'):
+                p.mul_(config.cov_init_scale); n_w += 1
+            elif name.endswith('bias'):
+                p.zero_(); p[diag_positions(S2_BANDS).to(p.device)] = raw0; n_b += 1
+    assert n_w == 1 and n_b == 1, f'expected one weight and one bias in out_conv_cov, found {n_w}/{n_b}'
+    print(f'Initialised covariance head: initial sigma = {sigma0:.4g}, off-diagonals ~ 0')
